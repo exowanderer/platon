@@ -1,5 +1,9 @@
 from __future__ import print_function
 
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+from multiprocessing import Pool, cpu_count
+
 import os
 
 import numpy as np
@@ -7,10 +11,10 @@ import matplotlib.pyplot as plt
 import scipy.interpolate
 
 try:
-    import emcee
+    import nestle
 except:
-    !pip install git+https://github.com/dfm/emcee
-    import emcee
+    !pip install nestle
+    import nestle
 
 try:
     import corner
@@ -26,9 +30,9 @@ except:
 
 try:
     import platon
+    del platon
 except:
     !pip install git+https://github.com/ideasrule/platon
-    import platon
 
 from datetime import datetime
 
@@ -41,6 +45,19 @@ from platon.transit_depth_calculator import TransitDepthCalculator
 from platon.errors import AtmosphereError
 
 from sklearn.externals import joblib
+
+from argparse import ArgumentParser
+
+ap = ArgumentParser()
+ap.add_argument('-bm', '--bayesianmodel', required=False, default='emcee', type=str, help="type of bayesian model: 'mutlinest' or 'emcee'")
+ap.add_argument('-nw', '--num_walkers', required=False, default=50, type=int, help='number of walkers in emcee')
+ap.add_argument('-ns', '--num_steps', required=False, default=50, type=int, help='number of steps in emcee')
+
+args = vars(ap.parse_args())
+
+bayesian_model = args['bayesianmodel'] if 'bayesianmodel' in args.keys() else ap.get_default('bayesianmodel')
+nwalkers = args['num_walkers'] if 'num_walkers' in args.keys() else ap.get_default('num_walkers')
+nsteps = args['num_steps'] if 'num_steps' in args.keys() else ap.get_default('num_steps')
 
 def hd209458b_stis():
     #http://iopscience.iop.org/article/10.1086/510111/pdf
@@ -69,25 +86,21 @@ def hd209458b_spitzer():
     depths = []
     errors = []
 
-    # IRAC Channel 1 - 3.6 microns
     wave_bins.append([3.2, 4.0])
     RpRs = np.average([0.12077, 0.1222, 0.11354, 0.11919], weights=1.0/np.array([0.00085, 0.00062, 0.00087, 0.00032]))
     depths.append(RpRs**2)
     errors.append(0.00032/RpRs * 2 * depths[-1])
 
-    # IRAC Channel 2 - 4.5 microns
     wave_bins.append([4.0, 5.0])
     RpRs = np.average([0.12199, 0.12099], weights=1.0/np.array([0.00094, 0.00029]))
     depths.append(RpRs**2)
     errors.append(0.00029/RpRs * 2 * depths[-1])
 
-    # IRAC Channel 3 - 6.0 microns
     wave_bins.append([5.1, 6.3])
     RpRs = np.average([0.12007, 0.11880], weights=1.0/np.array([0.00248, 0.00272]))
     depths.append(RpRs**2)
     errors.append(0.00248/RpRs * 2 * depths[-1])
 
-    # IRAC Channel 4 - 8.0 microns
     wave_bins.append([6.6, 9.0])
     RpRs = np.average([0.12007, 0.11991], weights=1.0/np.array([0.00114, 0.00073]))
     depths.append(RpRs**2)
@@ -136,43 +149,62 @@ fit_info = retriever.get_default_fit_info(
 fit_info.add_gaussian_fit_param('Rs', 0.02*R_sun)
 fit_info.add_gaussian_fit_param('Mp', 0.04*M_jup)
 
-# Here, emcee is initialized with walkers where R is between 0.9*R_guess and
-# 1.1*R_guess.  However, the hard limit on R is from 0 to infinity.
-fit_info.add_uniform_fit_param('Rp', 0, np.inf, 0.9*R_guess, 1.1*R_guess)
-
-fit_info.add_uniform_fit_param('T', 300, 3000, 0.5*T_guess, 1.5*T_guess)
-fit_info.add_uniform_fit_param("log_scatt_factor", 0, 5, 0, 1)
+fit_info.add_uniform_fit_param('Rp', 0.9*R_guess, 1.1*R_guess)
+fit_info.add_uniform_fit_param('T', 0.5*T_guess, 1.5*T_guess)
+fit_info.add_uniform_fit_param("log_scatt_factor", 0, 1)
 fit_info.add_uniform_fit_param("logZ", -1, 3)
 fit_info.add_uniform_fit_param("log_cloudtop_P", -0.99, 5)
-fit_info.add_uniform_fit_param("error_multiple", 0, np.inf, 0.5, 5)
+fit_info.add_uniform_fit_param("error_multiple", 0.5, 5)
 
-#Use Affine Invariant Ensemble MCMC  to do the fitting
+#Use Nested Sampling to do the fitting
+# with ThreadPoolExecutor() as executor:
+# with ProcessPoolExecutor() as executor:
 time_stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-nsteps = 1000
-nwalkers = 100
-result = retriever.run_emcee(wave_bins, depths, errors, fit_info, nwalkers=nwalkers, nsteps=nsteps, plot_best=False)
 
-result_dict = {'flatchain':result.flatchain, 'flatlnprob':result.flatlnprobability, 'chain':result.chain, 'lnprob':result.lnprobability}
-joblib.dump(result_dict, 'emcee_results_{}walkers_{}steps_{}.joblib.save'.format(nwalkers, nsteps, time_stamp))
+if bayesian_model == 'multinest':
+    with Pool(cpu_count()) as executor:
+        result = retriever.run_multinest(wave_bins, depths, errors, fit_info, nestle_kwargs={'pool':executor})#, 'bootstrap':0 # bootstrap for `dynesty`
+    
+    result_dict = {'samples':result.samples, 'weights':result.weights, 'logl':result.logl}
+    joblib.dump(result_dict, 'multinest_results_{}.joblib.save'.format(time_stamp))
+elif bayesian_model == 'emcee':
+    result = retriever.run_emcee(wave_bins, depths, errors, fit_info, nwalkers=nwalkers, nsteps=nsteps)
+    
+    result_dict = {'flatchain':result.flatchain, 'flatlnprob':result.flatlnprobability, 'chain':result.chain, 'lnprob':result.lnprobability}
+    joblib.dump(result_dict, 'emcee_results_{}walkers_{}steps_{}.joblib.save'.format(nwalkers, nsteps, time_stamp))
+else:
+    raise ValueError("Options for `bayesian_model` (-bm, --bayesianmodel) must be either 'multinest' or 'emcee'")
 
+# Establish the Range in Wavelength to plot high resolution figures
 wave_min = wave_bins.min()
 wave_max = wave_bins.max()
 
-wavelengths_theory = np.linspace(wave_min, wave_max,500)
+n_theory_pts = 500
+wavelengths_theory = np.linspace(wave_min, wave_max, n_theory_pts)
 half_diff_lam = 0.5*np.median(np.diff(wavelengths_theory))
 
+# Setup calculator to use the theoretical wavelengths
 calculator = TransitDepthCalculator(include_condensation=True)
 calculator.change_wavelength_bins(np.transpose([wavelengths_theory-half_diff_lam, wavelengths_theory+half_diff_lam]))
 
 retriever._validate_params(fit_info, calculator)
 
-best_params_arr = result.flatchain[np.argmax(result.flatlnprobability)]
+# Allocate the best-fit parameters from the `result` class
+if bayesian_model == 'multinest':
+    best_params_arr = result.samples[np.argmax(result.logl)]
+elif bayesian_model == 'emcee':
+    best_params_arr = result.flatchain[np.argmax(result.flatlnprobability)]
+else:
+    raise ValueError("Options for `bayesian_model` (-bm, --bayesianmodel) must be either 'multinest' or 'emcee'")
+
 best_params_dict = {key:val for key,val in zip(fit_info.fit_param_names, best_params_arr)}
 
+# Set the static parameteres to the default values
 for key in fit_info.all_params.keys():
     if key not in best_params_dict.keys():
         best_params_dict[key] = fit_info.all_params[key].best_guess
 
+# Assign the best fit model parameters to necessary variables
 Rs = best_params_dict['Rs']
 Mp = best_params_dict['Mp']
 Rp = best_params_dict['Rp']
@@ -193,6 +225,7 @@ log_part_size = best_params_dict['log_part_size']
 part_size_std = best_params_dict['part_size_std']
 ri = best_params_dict['ri']
 
+# Compute best-fit theoretical model
 try:
     wavelengths, calculated_depths = calculator.compute_depths(
         Rs, Mp, Rp, T_eq, logZ, CO_ratio,
@@ -201,8 +234,9 @@ try:
 except AtmosphereError as e:
     print(e)
 
+# Plot the data on top of the best fit high-resolution model
+plt.errorbar(METRES_TO_UM * np.mean(wave_bins, axis=1), depths, yerr=errors, fmt='.', color='k', zorder=100)
 plt.plot(METRES_TO_UM * wavelengths, calculated_depths)
-plt.errorbar(METRES_TO_UM * np.mean(wave_bins, axis=1), depths, yerr=errors, fmt='.', color='k')
 
 plt.xlabel("Wavelength (um)")
 plt.ylabel("Transit depth")
@@ -210,9 +244,21 @@ plt.xscale('log')
 
 plt.tight_layout()
 
-plt.savefig('emcee_best_fit_{}walkers_{}steps_{}.png'.format(nwalkers, nsteps, time_stamp))
+if bayesian_model == 'multinest':
+    plt.savefig('multinest_best_fit_{}.png'.format(time_stamp))
+elif bayesian_model == 'emcee':
+    plt.savefig('emcee_best_fit_{}walkers_{}steps_{}.png'.format(nwalkers, nsteps, time_stamp))
+else:
+    raise ValueError("Options for `bayesian_model` (-bm, --bayesianmodel) must be either 'multinest' or 'emcee'")
 
-res_flatchain_df = DataFrame(result.flatchain, columns=fit_info.fit_param_names)
+
+# GTC: Grand Triangle of Confusion; i.e. Prettier Corner Plot
+if bayesian_model == 'multinest':
+    res_flatchain_df = DataFrame(result.samples, columns=fit_info.fit_param_names)
+elif bayesian_model == 'emcee':
+    res_flatchain_df = DataFrame(result.flatchain, columns=fit_info.fit_param_names)
+else:
+    raise ValueError("Options for `bayesian_model` (-bm, --bayesianmodel) must be either 'multinest' or 'emcee'")
 
 if 'Rs' in fit_info.fit_param_names: res_flatchain_df['Rs'] = res_flatchain_df['Rs'] / R_sun
 if 'Rp' in fit_info.fit_param_names: res_flatchain_df['Rp'] = res_flatchain_df['Rp'] / R_jup
@@ -223,7 +269,8 @@ plt.rcParams['figure.figsize'] = (10,10)
 
 fit_param_names = ['Rs [Rsun]', 'Mp [Mjup]', 'Rp [Rjup]', 'T [K]', 'log(haze)', 'logZ [FeH]', 'log(P_c) [mbar]', 'err_mod']
 
-pygtc_out = plotGTC(res_flatchain_df.values, 
+pygtc_out = plotGTC(res_flatchain_df.values,
+                    weights=result.weights if bayesian_model == 'multimodel' else None,
                     nContourLevels=3, 
                     paramNames=fit_param_names,
                     # range=[0.99] * result.flatchain.shape[1],
@@ -233,4 +280,9 @@ pygtc_out = plotGTC(res_flatchain_df.values,
                     # customLegendFont={'size':30},
                     figureSize=12);
 
-plt.savefig('emcee_gtc_{}walkers_{}steps_{}.png'.format(nwalkers, nsteps, time_stamp))
+if bayesian_model == 'multinest':
+    plt.savefig('multinest_gtc_{}.png'.format(time_stamp))
+elif bayesian_model == 'emcee':
+    plt.savefig('emcee_gtc_{}walkers_{}steps_{}.png'.format(nwalkers, nsteps, time_stamp))
+else:
+    raise ValueError("Options for `bayesian_model` (-bm, --bayesianmodel) must be either 'multinest' or 'emcee'")

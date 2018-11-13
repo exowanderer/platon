@@ -9,13 +9,21 @@ import emcee
 import nestle
 import copy
 
+from multiprocessing import cpu_count, Pool
+
+try:
+    import emcee as emcee
+    HAS_EMCEE = True
+    EMCEE_VERSION = int(emcee.__version__[0])
+except ImportError:
+    HAS_EMCEE = False
+
 from .transit_depth_calculator import TransitDepthCalculator
 from .fit_info import FitInfo
 from .constants import METRES_TO_UM
 from ._params import _UniformParam
 from .errors import AtmosphereError
 from ._output_writer import write_param_estimates_file
-
 
 class Retriever:
     def _validate_params(self, fit_info, calculator):
@@ -32,7 +40,6 @@ class Retriever:
         else:
             if fit_info.all_params["log_scatt_factor"].best_guess != 0:
                 raise ValueError("log scattering factor must be 0 if using Mie scattering")           
-            
         
         for name in fit_info.fit_param_names:
             this_param = fit_info.all_params[name]
@@ -115,8 +122,8 @@ class Retriever:
         return fit_info._ln_prior(params) + ln_prob
 
     def run_emcee(self, wavelength_bins, depths, errors, fit_info, nwalkers=50,
-                  nsteps=1000, include_condensation=True,
-                  plot_best=False):
+                  nsteps=1000, include_condensation=True, progress=True,
+                  plot_best=False, n_print_skip=100, ncores=cpu_count()):
         '''Runs affine-invariant MCMC to retrieve atmospheric parameters.
 
         Parameters
@@ -140,8 +147,14 @@ class Retriever:
         include_condensation : bool, optional
             When determining atmospheric abundances, whether to include
             condensation.
+        progress : bool, optional (default: True)
+            Use `tqdm` progress bar with `progress=True` for `emcee.EnsembleSampler.sample`
         plot_best : bool, optional
             If True, plots the best fit model with the data
+        n_print_skip : int, optional
+            The number of skips samples to run before printing out a status update
+        ncores: int, optional
+            The number of cpu cores to use with `emcee.EnsembleSampler.sample`
 
         Returns
         -------
@@ -156,25 +169,36 @@ class Retriever:
             result.flatlnprobability, an array of length WS
         '''
 
+        if not HAS_EMCEE:
+            import_error_message = "Operation `Retriever.run_emcee` requires `emcee` to be installed. \
+                                        Suggested `pip install git+https://gitub.com/dfm/emcee`"
+            
+            raise ImportError(import_error_message)
+
         initial_positions = fit_info._generate_rand_param_arrays(nwalkers)
         calculator = TransitDepthCalculator(
             include_condensation=include_condensation)
         calculator.change_wavelength_bins(wavelength_bins)
         self._validate_params(fit_info, calculator)
 
+        # with Pool(ncores) as pool:
         sampler = emcee.EnsembleSampler(
             nwalkers, fit_info._get_num_fit_params(), self._ln_prob,
-            args=(calculator, fit_info, depths, errors))
-
-        for i, result in enumerate(sampler.sample(
-                initial_positions, iterations=nsteps)):
-            if (i + 1) % 10 == 0:
-                print(str(i + 1) + "/" + str(nsteps),
-                      sampler.lnprobability[0, i], sampler.chain[0, i])
-
-        best_params_arr = sampler.flatchain[np.argmax(
-            sampler.flatlnprobability)]
+            args=(calculator, fit_info, depths, errors))#, pool=pool)
         
+        if EMCEE_VERSION >= 3:        
+            for i, result in enumerate(sampler.sample(initial_positions, iterations=nsteps, progress=progress)):
+                if (i + 1) % n_print_skip == 0:
+                    print(str(i + 1) + "/" + str(nsteps),
+                          sampler.lnprobability[0, -1], sampler.chain[0, -1])
+        else:
+            for i, result in enumerate(sampler.sample(initial_positions, iterations=nsteps)):
+                if (i + 1) % n_print_skip == 0:
+                    print(str(i + 1) + "/" + str(nsteps),
+                          sampler.lnprobability[0, -1], sampler.chain[0, -1])
+        
+        best_params_arr = sampler.flatchain[np.argmax(sampler.flatlnprobability)]
+
         write_param_estimates_file(
             sampler.flatchain,
             best_params_arr,
@@ -189,6 +213,7 @@ class Retriever:
                 depths,
                 errors,
                 plot=True)
+
         return sampler
 
     def run_multinest(self, wavelength_bins, depths, errors, fit_info,

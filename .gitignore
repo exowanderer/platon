@@ -1,2 +1,11 @@
 *.pyc
-*~
+*~*.png
+*.save
+
+examples/*.png
+examples/*.save
+examples/*.npy
+
+.ipynb_checkpoints
+build
+dist

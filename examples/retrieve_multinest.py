@@ -1,17 +1,50 @@
 from __future__ import print_function
 
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+from multiprocessing import Pool, cpu_count
+
 import os
 
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.interpolate
-import emcee
-import nestle
-import corner
 
+try:
+    import nestle
+except:
+    !pip install nestle
+    import nestle
+
+try:
+    import corner
+except:
+    !pip install corner
+    import corner
+
+try:
+    from pygtc import plotGTC
+except:
+    !pip install pygtc
+    from pygtc import plotGTC
+
+try:
+    import platon
+    del platon
+except:
+    !pip install git+https://github.com/ideasrule/platon
+
+from datetime import datetime
+
+from pandas import DataFrame
 from platon.fit_info import FitInfo
 from platon.retriever import Retriever
 from platon.constants import R_sun, R_jup, M_jup
+from platon.constants import METRES_TO_UM
+from platon.transit_depth_calculator import TransitDepthCalculator
+from platon.errors import AtmosphereError
+
+from sklearn.externals import joblib
 
 def hd209458b_stis():
     #http://iopscience.iop.org/article/10.1086/510111/pdf
@@ -66,7 +99,7 @@ stis_bins, stis_depths, stis_errors = hd209458b_stis()
 wfc3_bins, wfc3_depths, wfc3_errors = hd209458b_wfc3()
 spitzer_bins, spitzer_depths, spitzer_errors = hd209458b_spitzer()
 
-bins = np.concatenate([stis_bins, wfc3_bins, spitzer_bins])
+wave_bins = np.concatenate([stis_bins, wfc3_bins, spitzer_bins])
 depths = np.concatenate([stis_depths, wfc3_depths, spitzer_depths])
 errors = np.concatenate([stis_errors, wfc3_errors, spitzer_errors])
 
@@ -96,15 +129,104 @@ fit_info.add_uniform_fit_param("log_cloudtop_P", -0.99, 5)
 fit_info.add_uniform_fit_param("error_multiple", 0.5, 5)
 
 #Use Nested Sampling to do the fitting
-result = retriever.run_multinest(bins, depths, errors, fit_info, plot_best=True)
-plt.savefig("best_fit.png")
+# with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+# with ProcessPoolExecutor() as executor:
+with Pool(cpu_count()) as executor:
+    result = retriever.run_multinest(wave_bins, depths, errors, fit_info, nestle_kwargs={'pool':executor, 'bootstrap':0})
 
-np.save("samples.npy", result.samples)
-np.save("weights.npy", result.weights)
-np.save("logl.npy", result.logl)
+time_stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+result_dict = {'samples':result.samples, 'weights':result.weights, 'logl':result.logl}
+joblib.dump(result_dict, 'multinest_results_{}.joblib.save'.format(time_stamp))
 
-fig = corner.corner(result.samples, weights=result.weights,
-                    range=[0.99] * result.samples.shape[1],
-                    labels=fit_info.fit_param_names)
-fig.savefig("multinest_corner.png")
 
+# Establish the Range in Wavelength to plot high resolution figures
+wave_min = wave_bins.min()
+wave_max = wave_bins.max()
+
+n_theory_pts = 500
+wavelengths_theory = np.linspace(wave_min, wave_max, n_theory_pts)
+half_diff_lam = 0.5*np.median(np.diff(wavelengths_theory))
+
+# Setup calculator to use the theoretical wavelengths
+calculator = TransitDepthCalculator(include_condensation=True)
+calculator.change_wavelength_bins(np.transpose([wavelengths_theory-half_diff_lam, wavelengths_theory+half_diff_lam]))
+
+retriever._validate_params(fit_info, calculator)
+
+# Allocate the best-fit parameters from the `result` class
+best_params_arr = result.samples[np.argmax(result.logl)]
+best_params_dict = {key:val for key,val in zip(fit_info.fit_param_names, best_params_arr)}
+
+# Set the static parameteres to the default values
+for key in fit_info.all_params.keys():
+    if key not in best_params_dict.keys():
+        best_params_dict[key] = fit_info.all_params[key].best_guess
+
+# Assign the best fit model parameters to necessary variables
+Rs = best_params_dict['Rs']
+Mp = best_params_dict['Mp']
+Rp = best_params_dict['Rp']
+T_eq = best_params_dict['T']
+logZ = best_params_dict['logZ']
+CO_ratio = best_params_dict['CO_ratio']
+log_cloudtop_P = best_params_dict['log_cloudtop_P']
+log_scatt_factor = best_params_dict['log_scatt_factor']
+scatt_slope = best_params_dict['scatt_slope']
+error_multiple = best_params_dict['error_multiple']
+T_star = best_params_dict['T_star']
+
+T_spot = best_params_dict['T_spot']
+spot_cov_frac = best_params_dict['spot_cov_frac']
+frac_scale_height = best_params_dict['frac_scale_height']
+log_number_density = best_params_dict['log_number_density']
+log_part_size = best_params_dict['log_part_size']
+part_size_std = best_params_dict['part_size_std']
+ri = best_params_dict['ri']
+
+# Compute best-fit theoretical model
+try:
+    wavelengths, calculated_depths = calculator.compute_depths(
+        Rs, Mp, Rp, T_eq, logZ, CO_ratio,
+        scattering_factor=10**log_scatt_factor, scattering_slope=scatt_slope,
+        cloudtop_pressure=10**log_cloudtop_P, T_star=T_star)
+except AtmosphereError as e:
+    print(e)
+
+# Plot the data on top of the best fit high-resolution model
+plt.errorbar(METRES_TO_UM * np.mean(wave_bins, axis=1), depths, yerr=errors, fmt='.', color='k', zorder=100)
+plt.plot(METRES_TO_UM * wavelengths, calculated_depths)
+
+plt.xlabel("Wavelength (um)")
+plt.ylabel("Transit depth")
+plt.xscale('log')
+
+plt.tight_layout()
+
+if bayesian_model == 'multinest':
+    plt.savefig('multinest_best_fit_{}.png'.format(time_stamp))
+if bayesian_model == 'emcee':
+    plt.savefig('emcee_best_fit_{}walkers_{}steps_{}.png'.format(nwalkers, nsteps, time_stamp))
+
+res_flatchain_df = DataFrame(result.samples, columns=fit_info.fit_param_names)
+
+if 'Rs' in fit_info.fit_param_names: res_flatchain_df['Rs'] = res_flatchain_df['Rs'] / R_sun
+if 'Rp' in fit_info.fit_param_names: res_flatchain_df['Rp'] = res_flatchain_df['Rp'] / R_jup
+if 'Mp' in fit_info.fit_param_names: res_flatchain_df['Mp'] = res_flatchain_df['Mp'] / M_jup
+
+plt.rcParams['figure.dpi'] = 150
+plt.rcParams['figure.figsize'] = (10,10)
+
+fit_param_names = ['Rs [Rsun]', 'Mp [Mjup]', 'Rp [Rjup]', 'T [K]', 'log(haze)', 'logZ [FeH]', 'log(P_c) [mbar]', 'err_mod']
+
+pygtc_out = plotGTC(res_flatchain_df.values, 
+                    weights=result.weights,
+                    nContourLevels=3, 
+                    paramNames=fit_param_names,
+                    # range=[0.99] * result.flatchain.shape[1],
+                    # chainLabels=['Not Cheap', 'Cheap'],
+                    customLabelFont={'size':10},
+                    customTickFont={'size':7},
+                    # customLegendFont={'size':30},
+                    figureSize=12);
+
+plt.savefig('multinest_gtc_{}.png'.format(time_stamp))
