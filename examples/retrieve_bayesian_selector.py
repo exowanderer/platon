@@ -68,7 +68,7 @@ wavelengths, wave_errs, depths, errors = hd209458b.planetary_spectra_table.value
 wavelengths = (wavelengths*micron).to(meter).value
 wave_errs = (wave_errs*micron).to(meter).value
 
-wave_bins = np.transpose([wavelengths - wave_errs,wavelengths + wave_errs])
+wave_bins = np.transpose([wavelengths - wave_errs, wavelengths + wave_errs])
 
 #create a Retriever object
 retriever = Retriever()
